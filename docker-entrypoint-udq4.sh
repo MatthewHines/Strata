@@ -197,6 +197,17 @@ cfg["vision"] = {"exe": "/opt/strata/engine/strata-vision",
                  "gpu": False, "threads": 4}
 if int(os.environ.get("VISION_MAX_TOKENS", "0")) > 0:
     cfg["vision"]["max_tokens"] = int(os.environ["VISION_MAX_TOKENS"])
+# Display identity (Matt 10-06): the model-selector label is prettified from the
+# serve model_name (GET /v1/models id). The old name led with "unsloth-ud", which
+# describes the quant's origin, not the server - this box serves it from Strata,
+# and the Unsloth Desktop (UD) llama.cpp fork is a DIFFERENT provider on :8888.
+# Files and dirs keep the unsloth-ud tag (TAG, $CFG_DIR, packs untouched); only
+# the advertised identity changes. NO `aliases` entry: /v1/models lists every
+# alias as its own selector row (#297), which would re-show the old name. Stale
+# callers asking the old id are still SERVED - the chat path answers any model
+# string ("Other names are still served, as before", server.py model_for).
+# Rollback = delete this line and recreate.
+cfg["model_name"] = "qwen3.8-flash-next-q4_k_xl"
 json.dump(cfg, open(p, "w"), indent=1)
 print("host overlay applied: vram-reserve " + os.environ.get("VRAM_RESERVE_MIB", "3072") + ", suffix-draft 7, expert-cache-per-layer, conv-cache 4096, vision=cpu(4 threads)")
 PY
