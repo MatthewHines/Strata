@@ -9,6 +9,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/dbg_probe.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
