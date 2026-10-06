@@ -187,7 +187,9 @@ cfg["parallel"] = int(os.environ.get("PARALLEL", "2"))
 # cap: the mtmd chunker picks the model-native count (~1024+ per screenshot).
 # CPU encode cost scales with tokens; if a picture ever hurts too much, floor
 # VISION_MAX_TOKENS at 1024 — never below. threads stays 4 (burst-only encoder;
-# decode needs the cores). GPU vision stays off: XL family has no GPU-vision
+# decode needs the cores; measured 10-06: encode ~= 1 s at the current token budget
+#   (the old “10-30 s per picture” note predates the token budget - do not quote it).
+# GPU vision stays off: XL family has no GPU-vision
 # wiring upstream and the CPU encoder holds zero VRAM.
 cfg["vision"] = {"exe": "/opt/strata/engine/strata-vision",
                  "mmproj": "/data/mmproj/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
