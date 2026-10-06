@@ -178,7 +178,7 @@ cfg["repeat_stop_tokens"] = int(os.environ.get("REPEAT_STOP_TOKENS", "256"))
 # batch carve and the speed dip showed; 2 keeps no-queue usability at most of the cache.
 # Entrypoint default = SoT (the q4_0 lesson): a bare recreate can never silently drift it;
 # PARALLEL=N env overrides per create for A/B. Solo turns keep full MTP either way.
-cfg["parallel"] = int(os.environ.get("PARALLEL", "2"))
+cfg["parallel"] = int(os.environ.get("PARALLEL", "1"))  # 10-06 Matt: back to single lane - constant solo speed (batch demotion gone); the 2-lane overlap value only pays if the queue shape suits the user, and it doesn't
 # Vision token budget (fixed 2026-10-02): the old cap 300 forced every image
 # BELOW the documented minimum for this architecture — llama.cpp load_hparams
 # warns "Qwen-VL models require at minimum 1024 image tokens to function
