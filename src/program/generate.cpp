@@ -8651,6 +8651,25 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (line.rfind("FLUSH", 0) == 0) {   // recovery: drop every conversation's carried state (live
+                                                  // tokens, checkpoints, parked conversations, retained K/V, slot
+                                                  // caches) between requests.  The next request resumes from
+                                                  // nothing: session_zero and a full prompt read - what a restart
+                                                  // does to this state, without reloading the model.
+                if (batch_on()) { std::printf("ERR FLUSH: not while batch slots are decoding\n"); std::fflush(stdout); continue; }
+                live.clear();
+                live_imgs.clear();
+                live_ok = false;
+                checks.clear();
+                for (auto& sl : bs) sl = BSlot{};   // idle slot caches hold sequences too
+                const size_t was_bytes = conversations.bytes(), was_n = conversations.size();
+                conversations.clear_all();
+                std::printf("FLUSHED tokens=0 parked=%zu bytes=%zu\n", was_n, was_bytes);
+                std::fflush(stdout);
+                std::fprintf(stderr, "strata serve: FLUSH: dropped %zu parked conversation%s (%zu bytes); the next "
+                             "request reads its prompt from 0\n", was_n, was_n == 1 ? "" : "s", was_bytes);
+                continue;
+            }
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";

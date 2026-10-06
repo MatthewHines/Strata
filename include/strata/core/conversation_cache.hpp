@@ -208,6 +208,11 @@ public:
         return n;
     }
 
+    // Recovery: drop every parked conversation and the retained K/V - what an engine restart does to this
+    // state, without the model reload.  The next request finds nothing to resume from and reads its prompt
+    // from token 0 (`session_zero` and all): the always-correct path, the one every new conversation takes.
+    void clear_all() { entries_.clear(); bytes_ = 0; reuse_ = {}; }
+
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
