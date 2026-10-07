@@ -142,6 +142,17 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# Degeneration latch recovery (issue #606 on this box, 2026-10-07): a one-token loop is an ENGINE-STATE
+# latch - FLUSH (or a restart) cures it, the same conversation reads clean afterwards. The serve unlatches
+# automatically when the repeat guard trips: STRATA_DEGEN_UNLATCH=flush (default) | restart | off.
+# STRATA_DEGEN_UNLATCH_MAX caps consecutive unlatches without a clean reply between (default 3; after a
+# clean reply the budget refills - past it the loop lives in the replayed history, not in the engine).
+DEGEN_UNLATCH_DEFAULT = "flush"
+DEGEN_UNLATCH_MAX = 3
+# The post-hoc latch backstop: a reply that ends at length with the expert cache serving at (or above)
+# this hit rate with no repetition flagged is the pre-degeneration shape (a healthy reply runs 72-86%;
+# a degenerated run pins near 1.0 because a loop re-routes to the same experts every step).
+DEGEN_LATCH_DEFAULT = 0.99
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -889,6 +900,37 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+
+    def flush(self, timeout: float = 120.0) -> dict:
+        """`FLUSH` between requests (the caller holds the service's fifo): the engine drops every
+        conversation's carried state (live tokens, checkpoints, parked conversations, retained
+        K/V, slot caches), so the NEXT request reads its prompt from 0 - the degeneration cure
+        (issue #606's latch) without the model reload.  -> the engine's figures (parked, bytes);
+        raises ValueError when the engine refuses it, EngineDied when it ended.
+        Lines of an unfinished request (T/DONE) are drained on the way: the trip that asks for
+        the flush left the engine mid-generation, and its FLUSHED answer comes after its DONE."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self._send("FLUSH")
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the FLUSH command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the FLUSH command")
+            if line.startswith("FLUSHED"):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the FLUSH command")
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -2653,6 +2695,13 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        # #606 latch recovery: ending the reply stops the loop; this drops what the engine CARRIES for the
+        # conversation so the next request reads clean. A trip costs one unlatch; a normal reply refills the budget.
+        self.degen_trips = 0
+        try:
+            self.degen_latch = float(os.environ.get("STRATA_DEGEN_LATCH", str(DEGEN_LATCH_DEFAULT)))
+        except ValueError:
+            self.degen_latch = DEGEN_LATCH_DEFAULT
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -3403,6 +3452,43 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def _unlatch(self, log) -> None:
+        """Drop what the engine carries for this conversation, cheapest first (the caller holds the
+        service's fifo and has already logged the trip). A FLUSH clears the live session, checkpoints,
+        parked conversations and slot caches between requests: the NEXT request reads its prompt
+        from 0 - the cure a restart performs, for one prefill instead of a model reload. An engine
+        without the verb (or refusing it) falls back to the restart.
+        STRATA_DEGEN_UNLATCH=flush (default) | restart selects the live switch, read per trip."""
+        mode = os.environ.get("STRATA_DEGEN_UNLATCH", DEGEN_UNLATCH_DEFAULT).strip().lower()
+        if mode == "flush" and getattr(self.engine, "flush", None) is not None:
+            try:
+                got = self.engine.flush()
+                mb = int(got.get("bytes", 0)) // (1024 * 1024)
+                # one short line: podman wraps long ones and a wrapped event reads as nothing
+                log(f"unlatch: FLUSH ok parked={got.get('parked', '?')} dropped={mb}MB next=from-0")
+                return
+            except Exception as e:      # an older engine, a refused verb: the restart remains the cure
+                log(f"FLUSH unavailable ({e}); falling back to an engine restart")
+        if getattr(self.engine, "restart", None) is not None:
+            try:
+                self.engine.restart()
+            except Exception as e:      # never fail the request over recovery bookkeeping
+                log(f"degeneration: the engine restart failed ({e}); continuing without it")
+
+    def _degen_recover(self, why: str) -> None:
+        """A degeneration trip spends one unlatch; a normal reply refills the budget. Past
+        STRATA_DEGEN_UNLATCH_MAX consecutive unlatches the loop lives in the replayed history, not in
+        the engine's state: say so, stop spending, the client must prune."""
+        self.degen_trips += 1
+        limit = int(os.environ.get("STRATA_DEGEN_UNLATCH_MAX", str(DEGEN_UNLATCH_MAX)))
+        if self.degen_trips > limit:
+            print(f"[strata] degeneration {self.degen_trips}: the loop survived the earlier unlatches - the "
+                  f"cause rides in the conversation history now: start a fresh session (or prune the repeated "
+                  f"turns); further unlatches skipped", flush=True)
+            return
+        print(f"[strata] degeneration {self.degen_trips} ({why}): unlatching", flush=True)
+        self._unlatch(lambda msg: print(f"[strata] {msg}", flush=True))
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
@@ -3443,8 +3529,10 @@ class Service:
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         timings, before = None, None                    # this request's timings; the engine's `last` before it
+        hit_rate = None                                 # #606 latch backstop: set only when a DONE arrived
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        degen_tripped = False        # #606: this request already spent the unlatch (no double-charge)
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
@@ -3658,11 +3746,19 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                        self._degen_recover(f"reasoning looped at {n} tokens")
+                        degen_tripped = True
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
-                              "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
-                              "same, restart the server and report it (#606)", flush=True)
+                              "strata-<model>.json; 0 turns this off) (#606)", flush=True)
+                        # Recovery above the halt: the loop latches through whatever the ENGINE carries for
+                        # this conversation. The drain above left the engine idle; an unlatch drops the
+                        # carried state, so the NEXT request re-reads its prompt from clean state - the
+                        # manual cure (restart), automated and cheap (one prefill, no model reload).
+                        self._degen_recover(f"one token {run_len}x")
+                    elif n > 0 and finish != "error":
+                        self.degen_trips = 0            # a healthy reply: the unlatch budget is refilled
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -3732,6 +3828,18 @@ class Service:
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                        if (self.degen_latch and not repeated and not looped and not degen_tripped
+                                and finish == "length" and n >= 64
+                                and hit_rate is not None and hit_rate >= self.degen_latch):
+                            # The post-hoc backstop: no repetition tripped a net, yet the reply ended at
+                            # length with the expert cache serving it from memory almost the whole time -
+                            # the shape this box's latch collapses into (a loop re-routes to the same
+                            # experts every step: loops measured 97-100% hit, healthy 37-88% same session).
+                            self._degen_recover(f"length-ended at {hit_rate*100:.1f}% expert hit")
+                            degen_tripped = True
+                        elif (not repeated and not looped and finish in ("stop", "length") and n > 0
+                                and hit_rate is not None and hit_rate < self.degen_latch):
+                            self.degen_trips = 0        # healthy hit rate: the budget is refilled
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
