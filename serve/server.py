@@ -152,7 +152,19 @@ DEGEN_UNLATCH_MAX = 3
 # The post-hoc latch backstop: a reply that ends at length with the expert cache serving at (or above)
 # this hit rate with no repetition flagged is the pre-degeneration shape (a healthy reply runs 72-86%;
 # a degenerated run pins near 1.0 because a loop re-routes to the same experts every step).
-DEGEN_LATCH_DEFAULT = 0.99
+DEGEN_LATCH_DEFAULT = 0.93   # 10-07: today's healthy band ran 87-89.6% hit, the "13" episode 93.6-94.3%
+# Block-cycle net (fork era, #75 class): the decoded tail ending in the same block R times,
+# confirmed on a second window 16 tokens later. 0 disables via STRATA_DEGEN_CYCLE.
+DEGEN_CYCLE_REPEATS = 9
+DEGEN_CYCLE_MAXP = 256
+DEGEN_CYCLE_MAXCH = DEGEN_CYCLE_REPEATS * DEGEN_CYCLE_MAXP
+# Content-collapse net (the 10-07 "13" episode): a reply whose last 64 ids hold at most DEGEN_DIV
+# DISTINCT ids after 512 tokens has collapsed onto a tiny id set - scaffolding intact, content a
+# 2-3 id cycle. Neither the one-token run net (punctuation resets the run) nor the strict-cycle net
+# (the punctuation is irregular) sees it; a healthy turn cycles 40+ distinct ids per 64. 0 disables.
+DEGEN_DIV = 6
+DEGEN_DIV_WINDOW = 64
+DEGEN_DIV_MIN_N = 512
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -2702,6 +2714,9 @@ class Service:
             self.degen_latch = float(os.environ.get("STRATA_DEGEN_LATCH", str(DEGEN_LATCH_DEFAULT)))
         except ValueError:
             self.degen_latch = DEGEN_LATCH_DEFAULT
+        self.degen_cycle_repeats = int(os.environ.get("STRATA_DEGEN_CYCLE") or DEGEN_CYCLE_REPEATS)
+        self.degen_div = int(os.environ.get("STRATA_DEGEN_DIV") if os.environ.get("STRATA_DEGEN_DIV")
+                             is not None else DEGEN_DIV)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -3533,6 +3548,12 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         degen_tripped = False        # #606: this request already spent the unlatch (no double-charge)
+        repeat_kind = "token"                              # which net ended a repeated reply
+        div_collapse = False                               # content-collapse net tripped
+        cyc_tail, cyc_next, cyc_hits = [], 1, 0            # block-cycle detector: tail, next check, streak
+        div_win = collections.deque(maxlen=DEGEN_DIV_WINDOW)   # content-collapse: the last ids
+        open_call = [0]                                    # open tool-call watchdog (fork era)
+        max_open_call = int(os.environ.get("STRATA_MAX_OPEN_CALL", "12288") or 0)
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
@@ -3605,9 +3626,47 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                # Block-cycle net (fork era): a degenerate BLOCK slips past the one-token net
+                                # whole. Tail periodicity confirmed on a SECOND window 16 tokens later: a loop
+                                # lives through both; a one-shot periodic pattern (a table, a rule) never does.
+                                cyc_tail.append(t)
+                                if len(cyc_tail) > DEGEN_CYCLE_MAXCH + 32:
+                                    del cyc_tail[:-DEGEN_CYCLE_MAXCH]
+                                if self.degen_cycle_repeats and n >= cyc_next:
+                                    cyc_next = n + 16
+                                    win = self.tok.decode(cyc_tail)[-DEGEN_CYCLE_MAXCH:]
+                                    R = self.degen_cycle_repeats
+                                    cyc_hits = cyc_hits + 1 if any(
+                                        len(win) >= R * q and len(set(blk := win[-q:])) >= 2
+                                        and any(c.isalnum() for c in blk)
+                                        and win[-R * q:] == blk * R
+                                        for q in range(2, DEGEN_CYCLE_MAXP + 1)) else 0
+                                    if cyc_hits >= 2:
+                                        repeated, repeat_kind = True, "block"
+                                        break
+                                # Content-collapse net: distinct ids in the last window (checked every 32).
+                                div_win.append(t)
+                                if (self.degen_div and n >= DEGEN_DIV_MIN_N and n % 32 == 0
+                                        and len(div_win) == DEGEN_DIV_WINDOW
+                                        and len(set(div_win)) <= self.degen_div):
+                                    div_collapse = True
+                                    break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
+                                # Open tool-call watchdog (fork era): a call that never closes is a runaway the
+                                # repetition nets cannot see; a different class, so it ends on its own count.
+                                if parser.state != "call":
+                                    open_call[0] = 0
+                                elif max_open_call:
+                                    open_call[0] += 1
+                                    if open_call[0] > max_open_call:
+                                        print(f"[strata] tool call still open after {open_call[0]} tokens: "
+                                              f"degeneration, ending the reply (#606)", flush=True)
+                                        self._degen_recover(f"open tool call {open_call[0]} tokens")
+                                        degen_tripped = True
+                                        finish = "length"
+                                        break
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -3748,6 +3807,12 @@ class Service:
                               "strata-<model>.json; remove it to turn this off)", flush=True)
                         self._degen_recover(f"reasoning looped at {n} tokens")
                         degen_tripped = True
+                    elif repeated and repeat_kind == "block":
+                        print(f"[strata] the same block repeated {self.degen_cycle_repeats} times on both "
+                              f"re-check windows at {n} tokens: ended as \"length\" (STRATA_DEGEN_CYCLE=0 "
+                              "turns this off) (#606)", flush=True)
+                        self._degen_recover(f"block cycle at {n} tokens")
+                        degen_tripped = True
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
@@ -3757,6 +3822,13 @@ class Service:
                         # carried state, so the NEXT request re-reads its prompt from clean state - the
                         # manual cure (restart), automated and cheap (one prefill, no model reload).
                         self._degen_recover(f"one token {run_len}x")
+                        degen_tripped = True
+                    elif div_collapse:
+                        print(f"[strata] the reply collapsed to {len(set(div_win))} distinct tokens per "
+                              f"{DEGEN_DIV_WINDOW} at {n} tokens: ended as \"length\" (content-collapse net; "
+                              "STRATA_DEGEN_DIV=0 turns this off) (#606)", flush=True)
+                        self._degen_recover(f"content collapse at {n} tokens")
+                        degen_tripped = True
                     elif n > 0 and finish != "error":
                         self.degen_trips = 0            # a healthy reply: the unlatch budget is refilled
                 except GeneratorExit:                   # the client disconnected mid-stream
@@ -3829,7 +3901,7 @@ class Service:
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         if (self.degen_latch and not repeated and not looped and not degen_tripped
-                                and finish == "length" and n >= 64
+                                and finish in ("length", "cancel", "disconnect") and n >= 64
                                 and hit_rate is not None and hit_rate >= self.degen_latch):
                             # The post-hoc backstop: no repetition tripped a net, yet the reply ended at
                             # length with the expert cache serving it from memory almost the whole time -
