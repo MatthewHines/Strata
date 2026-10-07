@@ -107,6 +107,17 @@ setarg("--ple-io", "ram")
 # only on hardware/spec change (NOTE: upstream --calibrate drops into
 # foreground serving after measuring — kill it once '[ok] tuned' prints).
 setarg("--pool-workers", "5")
+# 10-07 degeneration RCA (MECHANISM-ESSAY.md): the adaptive expert tier changes which experts are
+# VRAM-resident while the engine runs, and the GPU-resident vs CPU-pool MoE paths compute an expert
+# from different-precision activation scales (fp16 half2 vs fp32) - so the same prompt prefix yields
+# different bits at different times. The conversation cache assumes state=f(prefix) is pure; that
+# churn is the violation, and wrong-parity checkpoints are what re-materialize degenerate basins
+# (the 13/! loops) across sessions until FLUSH/restart drops the chain. Freezing the table restores
+# the contract: within one process the state for a prefix is now reproducible, so checkpoints are
+# exactly what a recompute would produce. Cost: adaptive hit-rate gains (~a few points; PCIe share
+# set at 0.55 already). STRATA_ADAPT_SWAPS overrides; upstream fix = one shared numeric image.
+if "--adapt-swaps" not in args:
+    args.extend(["--adapt-swaps", os.environ.get("STRATA_ADAPT_SWAPS", "0")])
 setarg("--spec-min-p", "0.70")
 # Native (IQ) packs REQUIRE --spec T>=2 (+ --mtp) or the engine exits 2 at arg
 # validation BEFORE CUDA init ("needs --native SHARD1, --spec T (T >= 2)"). The
