@@ -54,12 +54,17 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& si
 /// snapshots and their validation all use this: a session saves and restores only the state it owns.
 bool conversation_session_sizes(const ModelGeometry& g, const SessionState& session, ConversationStateSizes& sizes,
                                 std::string& error);
+// `live_fp` / `fp` (#606): the hash of the expert-residency table the state is (or would be) computed under -
+// see ConversationCheckpoint::residency_fp.  A nonzero `live_fp` on validate/restore makes a checkpoint whose
+// capture table differs a hard failure (the caller's cache-miss path); a zero live table compares against
+// nothing (no adaptive tier).  `fp` on save stamps the checkpoint.  Both default to 0: callers without an
+// expert cache keep today's behavior untouched.
 bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, const SessionState& session,
-                                      const ModelGeometry& g, std::string& error);
+                                      const ModelGeometry& g, std::string& error, uint64_t live_fp = 0);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
-                                  const ModelGeometry& g, std::string& error);
+                                  const ModelGeometry& g, std::string& error, uint64_t fp = 0);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
-                                     const ModelGeometry& g, std::string& error);
+                                     const ModelGeometry& g, std::string& error, uint64_t live_fp = 0);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;
@@ -80,21 +85,24 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                uint64_t fp = 0);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
-                                   const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                   uint64_t fp = 0);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
-                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                    const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                    uint64_t live_fp = 0);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
-                                                   std::string& error);
+                                                   std::string& error, uint64_t live_fp = 0);
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
@@ -107,10 +115,12 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          size_t& bytes, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr, uint64_t fp = 0);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                    uint64_t live_fp = 0);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   uint64_t live_fp = 0);
 
 } // namespace strata::core

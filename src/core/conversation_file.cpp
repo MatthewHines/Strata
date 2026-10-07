@@ -45,7 +45,9 @@ namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
+// v2 (#606): checkpoints carry the expert-residency fingerprint; a v1 file is refused as unsupported and
+// its conversations re-prefill (the miss path, never a wrong-parity restore).
+constexpr uint32_t kVersion = 2;
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -684,6 +686,7 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
     o.u64(c.used);
+    o.u64(c.residency_fp);   // #606: the residency table this state was a function of
 }
 
 void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
@@ -759,7 +762,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+           in.vec(c.block_pos, m[4]) && in.u64(c.used) && in.u64(c.residency_fp);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -776,8 +779,8 @@ bool get_payload(In& in, SavedConversation& s) {
     s.cvec = cvec == 1;
     if (!get_checkpoint(in, s.live)) return false;
     uint64_t n = 0;
-    // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
-    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    // a checkpoint is at least 8 counts + used + residency_fp = 80 bytes; a K/V layer at least 7 + 5 = 96
+    if (!in.count(n, 80, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
