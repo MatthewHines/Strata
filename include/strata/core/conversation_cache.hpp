@@ -25,10 +25,23 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    // #606: the expert-residency fingerprint at capture. The conversation cache memoizes `state = f(prefix)`,
+    // but the GPU-resident expert path quantizes the activation scale at a different precision than the CPU
+    // pool, so a checkpoint computed under one residency table restores to a DIFFERENT number stream under
+    // another - and a wrong-parity state re-mounts degenerate basins across every session that forks from it.
+    // A restore whose live table hashes differently than this value is not the function's own input: the
+    // caller treats it as a cache miss and reads the tokens again (0 = a checkpoint captured before this
+    // field existed, or by a caller with no adaptive tier: never compared against a real table).
+    uint64_t residency_fp = 0;
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // #606 self-audit: how many times this checkpoint has been a resume point (a run-time mark like `pinned`: not
+    // in the session file).  --ckpt-verify-every re-reads the tokens instead of restoring on every Nth use of a
+    // deep conversation's checkpoint, so a poisoned memo cannot outlive N turns.  Per-checkpoint counting keeps the
+    // schedule deterministic for the conversation instead of depending on other chains' traffic.
+    uint32_t uses = 0;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;

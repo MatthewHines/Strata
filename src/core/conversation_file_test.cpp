@@ -66,6 +66,7 @@ ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
     c.dead = bytes_of(64, seed + 3);
     c.block_pos = bytes_of(8, seed + 4);
     c.used = 42 + seed;
+    c.residency_fp = 0x6066066066060ull + seed;   // #606: nonzero so the round trip proves the field persists
     return c;
 }
 
@@ -92,12 +93,13 @@ SavedConversation sample() {
     return s;
 }
 
-// format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878535;
-constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+// format v2 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
+constexpr size_t kGoldenSize = 17878559;
+constexpr uint64_t kGoldenHash = 0x0fcd377e4f07ee98ull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
+           a.residency_fp == b.residency_fp &&   // #606: the fingerprint must survive the round trip
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
 }
 
@@ -163,14 +165,15 @@ int main() {
     check(session_file_write(good.string(), original, id, written, error), "write succeeds");
     check(error.empty(), "write leaves no error");
 
-    // golden: format v1 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
+    // golden: format v2 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
     // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
+    // v2 (#606): checkpoints carry the expert-residency fingerprint, one u64 per checkpoint.
     {
         const std::vector<char> g = slurp(good);
         auto u32 = [&](size_t o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         auto u64 = [&](size_t o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         check(g.size() >= 80 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
-        check(u32(8) == 1 && u32(12) == 64, "golden: version 1, header 64 bytes (little-endian)");
+        check(u32(8) == 2 && u32(12) == 64, "golden: version 2, header 64 bytes (little-endian)");
         check(u64(16) == id.model && u64(24) == id.config, "golden: fingerprints at offsets 16 and 24");
         check(u64(32) == g.size() - 64 - 16, "golden: payload length at offset 32");
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
@@ -243,7 +246,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 99; std::memcpy(d.data() + 8, &v, 4);   // 2 is current (#606); 99 is no release
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");

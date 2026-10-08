@@ -88,8 +88,15 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     return p;
 }
 
+void DraftPolicy::reset() {
+    cost_.fill(0.0); cost_n_.fill(0.0); mtp_tok_.fill(0.0); mtp_n_.fill(0.0);
+    ok_.fill(0.0); bad_.fill(0.0); cok_.fill(0.0); cbad_.fill(0.0);
+    last_.fill(0.0); rounds_ = 0;
+}
+
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
+    if (costs_frozen_) round_ms = 0;   // #606: wall-clock must not move a window pick
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
@@ -137,6 +144,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
+    if (costs_frozen_) round_ms = 0;   // #606: same freeze for chained rounds
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;

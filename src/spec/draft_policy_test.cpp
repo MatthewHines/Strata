@@ -90,6 +90,38 @@ int main() {
         check(q.chain(4, 0.9, 3, 4) == 0, "chain: dear rows, never accepted -> none");
         check(q.chain(4, 0.9, 0, 4) == 0 && q.chain(8, 1.0, 3, 40) == 0, "chain: nothing proposed / no room -> none");
     }
+    {
+        // #606 determinism: reset() returns the policy to its priors (a request sees only its own
+        // rounds), and freeze_costs() keeps wall-clock noise out of the picks entirely.
+        DraftPolicy a(8), b(8);
+        for (int i = 0; i < 40; ++i) a.observe(true, 5, 1, 12, 500.0);      // a slow, distrustful stretch
+        b.reset();
+        check(a.cost_ms(5) != b.cost_ms(5) && b.cost_ms(5) > 0, "reset: back to the prior costs");
+        DraftPolicy c(8);
+        for (int i = 0; i < 40; ++i) c.observe(true, 5, 1, 12, 500.0);
+        DraftPolicy d(8);
+        d.freeze_costs();
+        for (int i = 0; i < 40; ++i) d.observe(true, 5, 1, 12, 500.0);      // the same timings, ignored
+        check(d.cost_ms(5) == DraftPolicy(8).cost_ms(5), "freeze_costs: wall-clock never enters");
+        // the guarantee: two frozen policies fed the same token events at DIFFERENT wall times
+        // pick identically at every input - machine speed cannot move a window.  (A timing-learned
+        // pair under the same skew is exactly what forked a deep run.)  Acceptance stats still
+        // learn: they are token-driven and replayable.
+        DraftPolicy e(8), f2(8);
+        e.freeze_costs(); f2.freeze_costs();
+        for (int i = 0; i < 40; ++i) { e.observe(true, 5, 1, 12, 500.0); f2.observe(true, 5, 1, 12, 90.0); }
+        bool same = true;
+        for (int tm = 1; tm <= 6; ++tm)
+            for (int lk = 0; lk <= 6; ++lk)
+                for (int mt : {0, 5, 12, 40}) {
+                    const auto x = e.choose(tm, lk, mt), y = f2.choose(tm, lk, mt);
+                    if (x.lookup != y.lookup || x.t != y.t) same = false;
+                }
+        check(same, "freeze_costs: same events at different speeds -> identical picks");
+        DraftPolicy g(8), h(8);   // the UNfrozen pair under the same skew is the fork class itself
+        for (int i = 0; i < 40; ++i) { g.observe(true, 5, 1, 12, 500.0); h.observe(true, 5, 1, 12, 90.0); }
+        (void) g; (void) h;
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

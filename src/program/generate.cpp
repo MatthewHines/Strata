@@ -585,6 +585,12 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// #606 self-audit: on every Nth use of a resume checkpoint at >= --ckpt-verify-min-tokens tokens, re-read
+    /// the tokens instead of restoring (the pure path: upstream's STRATA_CKPT_REREAD check, run as a policy).
+    /// The memo table's sampled re-derivation: a poisoned checkpoint can outlive at most N turns on a deep
+    /// chain. 0 = off (the upstream default).  Cost is one re-prefill per N turns on deep conversations only.
+    int ckpt_verify_every = 0;
+    int64_t ckpt_verify_min_tokens = 65536;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -1378,17 +1384,19 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
 }
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                     uint64_t fp = 0) {
     std::string error;
-    if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+    if (strata::core::conversation_checkpoint_save(c, ss, g, error, fp)) return true;
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                        uint64_t live_fp = 0) {
     std::string error;
-    if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
+    if (strata::core::conversation_checkpoint_restore(c, ss, g, error, live_fp)) return true;
     std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
     return false;
 }
@@ -1778,6 +1786,8 @@ int main(int argc, char** argv) {
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
+        else if (a == "--ckpt-verify-every") o.ckpt_verify_every = std::atoi(next("--ckpt-verify-every"));
+        else if (a == "--ckpt-verify-min-tokens") o.ckpt_verify_min_tokens = std::atoll(next("--ckpt-verify-min-tokens"));
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
@@ -5556,6 +5566,22 @@ int main(int argc, char** argv) {
     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     std::vector<int32_t> host_res;
+    // #606: a fingerprint of the expert-residency table - the (layer,expert)->VRAM-slot map the expert
+    // caches compute under. The conversation cache memoizes `state = f(prefix)`, but the GPU-resident and
+    // CPU-pool expert paths differ in the last bits, so that map is an input to f: checkpoints stamp this
+    // value on save and refuse a restore whose map moved since (ConversationCheckpoint::residency_fp).
+    // Hashed on demand: every mutation path (adapt apply_pending, kvg trim/refill, on-demand fill, prefill
+    // borrow) reads the same host_res, so nos a stamp variable to forget. 0 = no expert cache: with no
+    // tier the comparison is inert, exactly what --adapt-swaps 0 froze it to. The hash is the HOST view;
+    // with the adaptive tier on, a swap in flight (`pending`) pins one checkpoint to a re-prefill on
+    // compare - the safe side (a miss, never-deliberate; with the tier off the view is exact).
+    auto live_residency_fp = [&host_res]() -> uint64_t {
+        if (host_res.empty()) return 0;
+        uint64_t h = 1469598103934665603ull;
+        for (const int32_t s : host_res)
+            h = (h ^ (uint64_t) (uint32_t) s) * 1099511628211ull;
+        return h;
+    };
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
@@ -7156,7 +7182,7 @@ int main(int argc, char** argv) {
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
+                        std::move(reuse), &reused_bytes, live_residency_fp())) return false;   // #606: stamp the table
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -7164,7 +7190,7 @@ int main(int argc, char** argv) {
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
+                            std::move(stage_reuse[k]), &reused_bytes, live_residency_fp()))
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
@@ -7245,12 +7271,14 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                // #606: stamp the residency table this state is a function of (single-GPU: one table for
+                // every stage; a split's per-stage tables refresh through the same res_upload choke point).
+                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g, live_residency_fp())) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g, live_residency_fp())) return false;
                     c.stage_parts.push_back(std::move(part));
                 }
             }
@@ -7402,7 +7430,7 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-        // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
+        // a layer split's later stages own a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
                 res_put(d_res);
@@ -8124,6 +8152,9 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // #606 forensics: STRATA_DBG=draftpolicy logs each window choice (which drafter, which size) so an
+        // identical-send fork can be attributed to a changed pick without a rebuild. Off = silent, zero cost.
+        const bool dbg_draft = std::getenv("STRATA_DBG_DRAFT") != nullptr;
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -8302,8 +8333,8 @@ int main(int argc, char** argv) {
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                if (!strata::core::conversation_checkpoint_save(ck, from, g, e, live_residency_fp()) ||
+                    !strata::core::conversation_checkpoint_restore(ck, to, g, e, live_residency_fp()))
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                     strata::core::ConversationKv img;
@@ -8340,13 +8371,13 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
-                    if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                    if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e, live_residency_fp()))
                         return false;
                 } else {
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e, live_residency_fp()) ||
+                        !strata::core::conversation_checkpoint_restore(ck, to, g, e, live_residency_fp()))
                         return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
@@ -8828,7 +8859,7 @@ int main(int argc, char** argv) {
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
                         if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
+                                                                         err, live_residency_fp())) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
@@ -8889,7 +8920,9 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    // #606: a file whose live state was computed under another residency table is refused
+                    // here (the request thens cold-prefilled); never wrong-parity decode
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err, live_residency_fp())) {
                         refuse(err);
                         continue;
                     }
@@ -8902,7 +8935,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err, live_residency_fp()) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -9260,7 +9293,7 @@ int main(int argc, char** argv) {
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
+                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err, live_residency_fp()) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -9270,7 +9303,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err, live_residency_fp()) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -9353,9 +9386,18 @@ int main(int argc, char** argv) {
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
-                if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+                // #606 self-audit: every Nth use of a deep checkpoint reads the tokens again instead of
+                // restoring - the memo re-derived under the policy that caught this defect class at its root.
+                const bool verify_due = c != nullptr && o.ckpt_verify_every > 0 &&
+                                        resume >= o.ckpt_verify_min_tokens &&
+                                        (c->uses + 1) % (uint32_t) o.ckpt_verify_every == 0;
+                if (c != nullptr) { c->used = ++check_clock; ++c->uses; }   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-                if (reread && c != nullptr) {
+                // #606: the tier moved since this checkpoint was captured - the memoized state is no
+                // longer a function of the tokens alone; declare a miss and read the tokens again (the same
+                // path the STRATA_CKPT_REREAD check uses, upstream's own cure for exactly the stale case).
+                const bool fp_miss = c != nullptr && live_residency_fp() != 0 && c->residency_fp != live_residency_fp();
+                if ((reread || fp_miss || verify_due) && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
@@ -9369,13 +9411,15 @@ int main(int argc, char** argv) {
                         cudaStreamSynchronize(st->stream);
                     }
                     reread_to = resume;
-                    std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
-                                         "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                    std::fprintf(stderr, "strata serve: %s: reading %lld tokens again instead of restoring\n",
+                                 fp_miss ? "residency changed since the checkpoint (cache miss)"
+                                         : verify_due ? "checkpoint self-audit (every-Nth-use re-read)"
+                                                      : "STRATA_CKPT_REREAD", (long long) resume);
+                } else if (c == nullptr || !checkpoint_restore(*c, ss, g, live_residency_fp()) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g, live_residency_fp())) return true;
                                }
                                return false;
                            }()) {
@@ -9968,6 +10012,12 @@ int main(int argc, char** argv) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
             }
+            // #606 output determinism: the window policy restarts with the drafter, so its picks
+            // depend only on this request's rounds - never on which requests ran before it in the
+            // process (a batched verify window's bits are not order-invariant, so a pick that
+            // carried over from another conversation's traffic could move a deep greedy argmax).
+            policy.reset();
+            if (!std::getenv("STRATA_DRAFT_TIMING")) policy.freeze_costs();  // wall-clock out of the picks
             if (o.lookup_chain > 0) {
                 extra_sources_reset();
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
@@ -10257,6 +10307,8 @@ int main(int argc, char** argv) {
                     const int match = sfx.last_match();
                     if (k <= 0 || pl_sbuf[0] != chain0[0]) return;
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(w.T, std::min(k, S - 1), match);
+                    if (dbg_draft) std::fprintf(stderr, "strata dbg: pick lookup=%d t=%d (k=%d match=%d)\n",
+                                                 (int) pk.lookup, pk.t, std::min(k, S - 1), match);
                     if (!pk.lookup) return;
                     w.T = pk.t;
                     for (int i = 1; i < w.T; ++i) {
@@ -10641,6 +10693,8 @@ int main(int argc, char** argv) {
                     sfx_match = sfx.last_match();
                     if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        if (dbg_draft) std::fprintf(stderr, "strata dbg: pick2 lookup=%d t=%d (k=%d match=%d)\n",
+                                                     (int) pk.lookup, pk.t, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
