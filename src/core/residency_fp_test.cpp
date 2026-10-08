@@ -1,4 +1,4 @@
-// #606: tier-aware checkpoint identity tests (CPU-only, no CUDA: validate/refuse paths on plain vectors).
+// #606: tier-aware checkpoint identity tests (CPU-only, no CUDA: field semantics on plain structs).
 #include "strata/core/conversation_cache.hpp"   // the plain-data checkpoint struct; CUDA-free on purpose
 #include <cstdio>
 #include <cstring>
@@ -11,25 +11,27 @@ static void check(bool ok, const char* what) {
     if (!ok) { std::printf("FAIL: %s\n", what); ++failures; } else std::printf("ok: %s\n", what);
 }
 
-// ConversationCheckpoint::residency_fp is plain data; validate() must refuse a fingerprint mismatch and
-// accept a match or an unstamped checkpoint against an unstamped table. We exercise the STRUCTURAL rule
-// without a SessionState (the full function needs device state): validate's fingerprint clause is the last
-// one and pure arithmetic, so here we pin the field semantics the serve layer relies on, plus the file
-// round trip is already covered by conversation_file_test. This test pins the *policy* the engine reads.
+// ConversationCheckpoint::residency_fp is plain data carried through copy and the file round trip.
+// The RESTORE POLICY (10-08 evening): default = restore regardless of a moved table (upstream
+// behavior); refuse-on-move only with STRATA_FP_GUARD=1 (forensics). The guard's cost - a full
+// prompt re-prefill per turn once adaptive residency moves the table by design - outweighed what
+// it caught, so it never became a default. Mirrored here so a semantic change breaks loudly:
+//     guard off: always ok    guard on: live == 0 || stamp == live
 int main() {
     ConversationCheckpoint c;
     check(c.residency_fp == 0, "default-constructed checkpoint is unstamped (0)");
     c.residency_fp = 0xdeadbeefcafe1234ull;
     ConversationCheckpoint copy = c;
     check(copy.residency_fp == c.residency_fp, "copy carries the fingerprint");
-    // the comparison rule from conversation_checkpoint_validate: live 0 compares against nothing; a live
-    // table requires an equal stamp. Mirrored here so a semantic change breaks loudly in review:
-    auto policy_ok = [](uint64_t live, uint64_t stamp) { return live == 0 || stamp == live; };
-    check(policy_ok(0, 0), "no tier: unstamped restores (frozen-table deployments unaffected)");
-    check(policy_ok(0, 999), "no tier: a stamp from an old adaptive process still restores");
-    check(policy_ok(7, 7), "tier live: equal stamp restores");
-    check(!policy_ok(7, 8), "tier live: moved table refuses (the cache miss that cured the latch)");
-    check(!policy_ok(7, 0), "tier live: an unstamped legacy checkpoint refuses (re-prefill, never poison)");
+    auto policy_ok = [](bool guard, uint64_t live, uint64_t stamp) {
+        return !guard || live == 0 || stamp == live;
+    };
+    check(policy_ok(false, 7, 8), "guard off (default): a moved table still restores - cache replay wins");
+    check(policy_ok(false, 7, 0), "guard off (default): an unstamped checkpoint restores");
+    check(policy_ok(true, 0, 0), "guard on: no tier - unstamped restores");
+    check(policy_ok(true, 7, 7), "guard on: equal stamp restores");
+    check(!policy_ok(true, 7, 8), "guard on: moved table refuses (forensic mode)");
+    check(!policy_ok(true, 7, 0), "guard on: an unstamped legacy checkpoint refuses");
     std::printf(failures ? "FAILED %d\n" : "ALL PASS (%d failures)\n", failures);
     return failures ? 1 : 0;
 }
