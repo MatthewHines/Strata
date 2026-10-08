@@ -8151,6 +8151,9 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // #606 forensics: STRATA_DBG=draftpolicy logs each window choice (which drafter, which size) so an
+        // identical-send fork can be attributed to a changed pick without a rebuild. Off = silent, zero cost.
+        const bool dbg_draft = std::getenv("STRATA_DBG_DRAFT") != nullptr;
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -10278,6 +10281,8 @@ int main(int argc, char** argv) {
                     const int match = sfx.last_match();
                     if (k <= 0 || pl_sbuf[0] != chain0[0]) return;
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(w.T, std::min(k, S - 1), match);
+                    if (dbg_draft) std::fprintf(stderr, "strata dbg: pick lookup=%d t=%d (k=%d match=%d)\n",
+                                                 (int) pk.lookup, pk.t, std::min(k, S - 1), match);
                     if (!pk.lookup) return;
                     w.T = pk.t;
                     for (int i = 1; i < w.T; ++i) {
@@ -10662,6 +10667,8 @@ int main(int argc, char** argv) {
                     sfx_match = sfx.last_match();
                     if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        if (dbg_draft) std::fprintf(stderr, "strata dbg: pick2 lookup=%d t=%d (k=%d match=%d)\n",
+                                                     (int) pk.lookup, pk.t, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
