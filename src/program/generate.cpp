@@ -584,6 +584,12 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// #606 self-audit: on every Nth use of a resume checkpoint at >= --ckpt-verify-min-tokens tokens, re-read
+    /// the tokens instead of restoring (the pure path: upstream's STRATA_CKPT_REREAD check, run as a policy).
+    /// The memo table's sampled re-derivation: a poisoned checkpoint can outlive at most N turns on a deep
+    /// chain. 0 = off (the upstream default).  Cost is one re-prefill per N turns on deep conversations only.
+    int ckpt_verify_every = 0;
+    int64_t ckpt_verify_min_tokens = 65536;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -1779,6 +1785,8 @@ int main(int argc, char** argv) {
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
+        else if (a == "--ckpt-verify-every") o.ckpt_verify_every = std::atoi(next("--ckpt-verify-every"));
+        else if (a == "--ckpt-verify-min-tokens") o.ckpt_verify_min_tokens = std::atoll(next("--ckpt-verify-min-tokens"));
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
@@ -9355,13 +9363,18 @@ int main(int argc, char** argv) {
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
-                if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+                // #606 self-audit: every Nth use of a deep checkpoint reads the tokens again instead of
+                // restoring - the memo re-derived under the policy that caught this defect class at its root.
+                const bool verify_due = c != nullptr && o.ckpt_verify_every > 0 &&
+                                        resume >= o.ckpt_verify_min_tokens &&
+                                        (c->uses + 1) % (uint32_t) o.ckpt_verify_every == 0;
+                if (c != nullptr) { c->used = ++check_clock; ++c->uses; }   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
                 // #606: the tier moved since this checkpoint was captured - the memoized state is no
                 // longer a function of the tokens alone; declare a miss and read the tokens again (the same
                 // path the STRATA_CKPT_REREAD check uses, upstream's own cure for exactly the stale case).
                 const bool fp_miss = c != nullptr && live_residency_fp() != 0 && c->residency_fp != live_residency_fp();
-                if ((reread || fp_miss) && c != nullptr) {
+                if ((reread || fp_miss || verify_due) && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
@@ -9377,7 +9390,8 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: %s: reading %lld tokens again instead of restoring\n",
                                  fp_miss ? "residency changed since the checkpoint (cache miss)"
-                                         : "STRATA_CKPT_REREAD", (long long) resume);
+                                         : verify_due ? "checkpoint self-audit (every-Nth-use re-read)"
+                                                      : "STRATA_CKPT_REREAD", (long long) resume);
                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g, live_residency_fp()) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {

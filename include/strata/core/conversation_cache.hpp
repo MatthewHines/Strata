@@ -37,6 +37,11 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // #606 self-audit: how many times this checkpoint has been a resume point (a run-time mark like `pinned`: not
+    // in the session file).  --ckpt-verify-every re-reads the tokens instead of restoring on every Nth use of a
+    // deep conversation's checkpoint, so a poisoned memo cannot outlive N turns.  Per-checkpoint counting keeps the
+    // schedule deterministic for the conversation instead of depending on other chains' traffic.
+    uint32_t uses = 0;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
