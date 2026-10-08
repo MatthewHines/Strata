@@ -35,6 +35,17 @@ public:
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
+    /// #606 output determinism: forget everything learned so far - the policy restarts from
+    /// its priors, so a request's window picks depend only on that request's own rounds (the
+    /// same purity the checkpoint fingerprint enforces on KV memos).  Call per request, next
+    /// to the drafter's own reset.
+    void reset();
+    /// #606: ignore the round-time observations - the cost stays the machine prior, so no
+    /// wall-clock noise can move a pick.  Acceptance statistics (token-driven, reproducible)
+    /// keep learning.  A process whose picks must not depend on machine speed (deep greedy
+    /// decode where a batched-window bit flip moves the argmax) freezes costs.
+    void freeze_costs() { costs_frozen_ = true; }
+
     /// --lookup-chain: how many of `k_avail` lookup tokens to append after an MTP window of `t_mtp` tokens whose
     /// drafts all hold with probability `p_mtp` (estimated from the draft layer's own probabilities): the k with the
     /// best expected tokens per ms, E(t_mtp) + p_mtp (c + c^2 + .. + c^k) at the cost of t_mtp + k, if it beats the MTP
@@ -57,6 +68,7 @@ private:
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
+    bool costs_frozen_ = false;                            // #606: no wall-clock into the picks
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
 };

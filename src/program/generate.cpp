@@ -9992,6 +9992,12 @@ int main(int argc, char** argv) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
             }
+            // #606 output determinism: the window policy restarts with the drafter, so its picks
+            // depend only on this request's rounds - never on which requests ran before it in the
+            // process (a batched verify window's bits are not order-invariant, so a pick that
+            // carried over from another conversation's traffic could move a deep greedy argmax).
+            policy.reset();
+            if (!std::getenv("STRATA_DRAFT_TIMING")) policy.freeze_costs();  // wall-clock out of the picks
             if (o.lookup_chain > 0) {
                 extra_sources_reset();
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
