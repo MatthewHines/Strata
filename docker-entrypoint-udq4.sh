@@ -228,6 +228,10 @@ cp -f "$cfg" "/opt/strata/strata-$TAG.json"
 # stop is honoured only after a confirming re-sample of the same position (serve/server.py).
 # One decode of cost, prefix KV reused; STRATA_STOP_PROBE=0 to disable.
 export STRATA_STOP_PROBE="${STRATA_STOP_PROBE:-1}"
+# v0.1.41: the new CPU prefill-share default changes the last bits of an answer (upstream's own
+# release note). Bit-purity of decode is the whole #606 investigation surface - pin it off.
+# Upstream's identity test runs with this exact setting; flip to 1 to A/B the short-prompt speedup.
+export STRATA_PREFILL_CPU_SHARE="${STRATA_PREFILL_CPU_SHARE:-0}"
 # defect-D A/B (#606 RCA): flag-file switch - create HOST /var/home/flashnext/state/strata_dbg/CKPT_REREAD
 # (= /data/strata_dbg/CKPT_REREAD in here) before a restart to boot with STRATA_CKPT_REREAD=1 (every resume
 # re-reads its tokens instead of restoring the checkpoint state: the pure path upstream built as the
