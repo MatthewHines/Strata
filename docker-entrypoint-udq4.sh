@@ -220,7 +220,7 @@ if int(os.environ.get("VISION_MAX_TOKENS", "0")) > 0:
 # Rollback = delete this line and recreate.
 cfg["model_name"] = "qwen3.8-flash-next-q4_k_xl"
 json.dump(cfg, open(p, "w"), indent=1)
-print("host overlay applied: vram-reserve " + os.environ.get("VRAM_RESERVE_MIB", "3072") + ", suffix-draft 7, expert-cache-per-layer, conv-cache 4096, vision=cpu(4 threads)")
+print("host overlay applied: vram-reserve " + os.environ.get("VRAM_RESERVE_MIB", "3072") + ", suffix-draft " + os.environ.get("SUFFIX_DRAFT", "7") + ", expert-cache-per-layer, conv-cache 4096, vision=cpu(4 threads)")
 PY
 cp -f "$cfg" "/opt/strata/strata-$TAG.json"
 
@@ -228,6 +228,17 @@ cp -f "$cfg" "/opt/strata/strata-$TAG.json"
 # stop is honoured only after a confirming re-sample of the same position (serve/server.py).
 # One decode of cost, prefix KV reused; STRATA_STOP_PROBE=0 to disable.
 export STRATA_STOP_PROBE="${STRATA_STOP_PROBE:-1}"
+# defect-D A/B (#606 RCA): flag-file switch - create HOST /var/home/flashnext/state/strata_dbg/CKPT_REREAD
+# (= /data/strata_dbg/CKPT_REREAD in here) before a restart to boot with STRATA_CKPT_REREAD=1 (every resume
+# re-reads its tokens instead of restoring the checkpoint state: the pure path upstream built as the
+# checkpoint self-check). Collapses absent in this mode => the carrier is fork-from-checkpoint parity.
+# Costs a full re-prefill per turn; A/B window only, not steady state. Host path survives restarts; /tmp
+# inside the container does not.
+[ -e /data/strata_dbg/CKPT_REREAD ] && export STRATA_CKPT_REREAD=1
+# #606 pick-determinism forensics (branch build only; the flag is inert on vanilla engines):
+# log each DraftPolicy window pick to the engine log so an identical-send fork can be read
+# as a changed pick (policy) or not (deeper). Flag file: host strata-data/strata_dbg/DRAFT_PICK.
+[ -e /data/strata_dbg/DRAFT_PICK ] && export STRATA_DBG_DRAFT=1
 # (host overlay v8 10-04) degeneration recovery (serve/server.py): the block-cycle net is
 # upstream opt-in; this host has SEEN block loops on Strata (#75 class), so it ships on at
 # the tested length. 0 disables. The net ends a reply whose decoded tail repeats the same
