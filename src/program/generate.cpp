@@ -9376,8 +9376,11 @@ int main(int argc, char** argv) {
                 // #606: the tier moved since this checkpoint was captured - the memoized state is no
                 // longer a function of the tokens alone; declare a miss and read the tokens again (the same
                 // path the STRATA_CKPT_REREAD check uses, upstream's own cure for exactly the stale case).
+                // #606: refuse-on-move is OPT-IN (STRATA_FP_GUARD): with adaptive residency the
+                // table drifts by design, and refusing cost all conversation-cache replay.
                 const bool fp_miss = c != nullptr && live_residency_fp() != 0 && c->residency_fp != live_residency_fp();
-                if ((reread || fp_miss || verify_due) && c != nullptr) {
+                static const bool fp_guard = std::getenv("STRATA_FP_GUARD") != nullptr;
+                if ((reread || (fp_miss && fp_guard) || verify_due) && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed

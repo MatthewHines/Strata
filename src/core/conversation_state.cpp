@@ -152,7 +152,10 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     // function of the prefix (the GPU-resident and CPU-pool expert paths differ in the last bits), so a
     // mismatch is declared a miss.  A checkpoint with no stamp predates the tier story: it survives only
     // while the live table is also unstamped (no adaptive tier running).
-    if (live_fp != 0 && c.residency_fp != live_fp) return fail(error, "expert residency changed since capture");
+    // #606 10-08: refuse-on-move is OPT-IN (STRATA_FP_GUARD): under adaptive residency the
+    // table drifts by design; refusing the resume cost full prompt re-reads on every turn.
+    static const bool fp_guard = std::getenv("STRATA_FP_GUARD") != nullptr;
+    if (fp_guard && live_fp != 0 && c.residency_fp != live_fp) return fail(error, "expert residency changed since capture");
     return true;
 }
 
