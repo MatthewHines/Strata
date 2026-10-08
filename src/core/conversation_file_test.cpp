@@ -93,13 +93,15 @@ SavedConversation sample() {
     return s;
 }
 
-// format v2 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878559;
-constexpr uint64_t kGoldenHash = 0x0fcd377e4f07ee98ull;
+// format v3 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
+// v3 (+8B per checkpoint: the compute fingerprint) regenerated 10-08 via STRATA_SESSION_GOLDEN_PRINT.
+constexpr size_t kGoldenSize = 17878583;
+constexpr uint64_t kGoldenHash = 0xad3d61c40e7bef3eull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
            a.residency_fp == b.residency_fp &&   // #606: the fingerprint must survive the round trip
+           a.compute_fp == b.compute_fp &&       // #606: and so must the compute stamp
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
 }
 
@@ -167,13 +169,14 @@ int main() {
 
     // golden: format v2 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
     // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
-    // v2 (#606): checkpoints carry the expert-residency fingerprint, one u64 per checkpoint.
+    // v2 (#606): checkpoints carry the expert-residency fingerprint; v3 (#606 layer-aware) adds the
+    // compute fingerprint - one more u64 per checkpoint.
     {
         const std::vector<char> g = slurp(good);
         auto u32 = [&](size_t o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         auto u64 = [&](size_t o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         check(g.size() >= 80 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
-        check(u32(8) == 2 && u32(12) == 64, "golden: version 2, header 64 bytes (little-endian)");
+        check(u32(8) == 3 && u32(12) == 64, "golden: version 3, header 64 bytes (little-endian)");
         check(u64(16) == id.model && u64(24) == id.config, "golden: fingerprints at offsets 16 and 24");
         check(u64(32) == g.size() - 64 - 16, "golden: payload length at offset 32");
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");

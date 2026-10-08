@@ -47,7 +47,9 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 // v2 (#606): checkpoints carry the expert-residency fingerprint; a v1 file is refused as unsupported and
 // its conversations re-prefill (the miss path, never a wrong-parity restore).
-constexpr uint32_t kVersion = 2;
+// v3 (#606): one more u64 per checkpoint (the compute fingerprint). v2 files refuse as a version
+// mismatch - a plain cache miss (one re-prefill), never a wrong-parity cold start.
+constexpr uint32_t kVersion = 3;
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -687,6 +689,7 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
     o.u64(c.used);
     o.u64(c.residency_fp);   // #606: the residency table this state was a function of
+    o.u64(c.compute_fp);     // #606: the compute path that produced these numbers
 }
 
 void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
@@ -762,7 +765,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used) && in.u64(c.residency_fp);
+           in.vec(c.block_pos, m[4]) && in.u64(c.used) && in.u64(c.residency_fp) && in.u64(c.compute_fp);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -779,7 +782,7 @@ bool get_payload(In& in, SavedConversation& s) {
     s.cvec = cvec == 1;
     if (!get_checkpoint(in, s.live)) return false;
     uint64_t n = 0;
-    // a checkpoint is at least 8 counts + used + residency_fp = 80 bytes; a K/V layer at least 7 + 5 = 96
+    // a checkpoint is at least 8 counts + used + two stamps = 88 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 80, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;

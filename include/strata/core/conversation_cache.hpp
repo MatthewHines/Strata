@@ -33,6 +33,13 @@ struct ConversationCheckpoint {
     // caller treats it as a cache miss and reads the tokens again (0 = a checkpoint captured before this
     // field existed, or by a caller with no adaptive tier: never compared against a real table).
     uint64_t residency_fp = 0;
+    // #606 layer-aware rules: the COMPUTE fingerprint at capture - model file identity + engine version +
+    // the boot-time compute-path flags (the ones that change kernel order/shape, so fp reassociation makes
+    // different numbers). Unlike residency (placement moves bytes, not values: a moved table is NOT a
+    // reason to drop a conversation's cache - field-proven 10-08), a compute change genuinely invalidates
+    // the memoized state: the caller treats the mismatch as a cache miss and re-reads the tokens.
+    // 0 = captured before this field existed, or by an engine with no compute stamp: never compared.
+    uint64_t compute_fp = 0;
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.

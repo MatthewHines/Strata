@@ -54,6 +54,12 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& si
 /// snapshots and their validation all use this: a session saves and restores only the state it owns.
 bool conversation_session_sizes(const ModelGeometry& g, const SessionState& session, ConversationStateSizes& sizes,
                                 std::string& error);
+// #606 layer-aware rules: the engine sets its COMPUTE fingerprint once at boot (model pack + version +
+// the flags that change kernel order/shape). A checkpoint stamped with a different compute fingerprint is
+// a hard validation failure - a cache miss, re-read - because the memoized numbers are genuinely from a
+// different function. Residency (placement) never refuses: see ConversationCheckpoint::compute_fp.
+void set_compute_fp(uint64_t fp);
+uint64_t compute_fp();
 // `live_fp` / `fp` (#606): the hash of the expert-residency table the state is (or would be) computed under -
 // see ConversationCheckpoint::residency_fp.  A nonzero `live_fp` on validate/restore makes a checkpoint whose
 // capture table differs a hard failure (the caller's cache-miss path); a zero live table compares against

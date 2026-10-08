@@ -2182,6 +2182,26 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
         return 2;
     }
+    // #606 layer-aware: stamp the boot-time COMPUTE path once, before any conversation state exists.
+    // Identity = what changes the numbers: the pack/model files, the engine version, and every boot flag
+    // that picks a different kernel order or shape (fp reassociation changes the last bits): KV storage
+    // and rotation, the CPU-share prefill kernels, the chunked GDN recurrence, the embedding-reuse
+    // planner, the spec/suffix draft family, and the draft-vocab build. Placement flags are deliberately
+    // ABSENT (adapt/pin/warm move bytes, not values). See ConversationCheckpoint::compute_fp.
+    {
+        auto flag = [](const char* n) { const char* v = std::getenv(n); return v ? v : ""; };
+        std::string path = o.pack;
+        path += "|"; path += o.kv;
+        path += "|"; path += o.ple_gguf;
+        path += "|ver:" STRATA_VERSION;
+        path += "|spec:" + std::to_string(o.spec) + "|sfx:" + std::to_string(o.suffix_draft);
+        for (const char* e : {"STRATA_KV_ROT", "STRATA_PREFILL_CPU_SHARE", "STRATA_GDN_CHUNKED",
+                              "STRATA_EMB_REUSE_ACCOUNT", "STRATA_FP_GUARD"})
+            { path += "|"; path += e; path += "="; path += flag(e); }
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char ch : path) h = (h ^ ch) * 1099511628211ull;
+        strata::core::set_compute_fp(h);
+    }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to

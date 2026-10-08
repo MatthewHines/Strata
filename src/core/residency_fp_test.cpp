@@ -32,6 +32,15 @@ int main() {
     check(policy_ok(true, 7, 7), "guard on: equal stamp restores");
     check(!policy_ok(true, 7, 8), "guard on: moved table refuses (forensic mode)");
     check(!policy_ok(true, 7, 0), "guard on: an unstamped legacy checkpoint refuses");
+    // #606 layer-aware rule (conversation_state.cpp validate): the COMPUTE path is part of f.
+    // Mirrored here so a semantic change breaks loudly:
+    //     refuse only when both sides are stamped AND differ; a zero on either side never compares.
+    auto compute_ok = [](uint64_t live, uint64_t stamp) {
+        return !(live != 0 && stamp != 0 && stamp != live);
+    };
+    check(compute_ok(0, 0) && compute_ok(0, 9) && compute_ok(9, 0), "compute rule: a zero side never compares (legacy/unset stay today's behavior)");
+    check(compute_ok(9, 9), "compute rule: equal compute path restores");
+    check(!compute_ok(9, 8), "compute rule: a changed compute path refuses (real invalidation: cache miss, re-read)");
     std::printf(failures ? "FAILED %d\n" : "ALL PASS (%d failures)\n", failures);
     return failures ? 1 : 0;
 }

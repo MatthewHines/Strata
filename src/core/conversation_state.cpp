@@ -139,6 +139,12 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, 
     return true;
 }
 
+// #606: one compute fingerprint per engine process, set at boot before any conversation state exists,
+// read by every checkpoint validate/save (a plain global: boot-set, never raced).
+static uint64_t g_compute_fp = 0;
+void set_compute_fp(uint64_t fp) { g_compute_fp = fp; }
+uint64_t compute_fp() { return g_compute_fp; }
+
 bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error, uint64_t live_fp) {
     ConversationStateSizes z;
@@ -156,6 +162,12 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     // table drifts by design; refusing the resume cost full prompt re-reads on every turn.
     static const bool fp_guard = std::getenv("STRATA_FP_GUARD") != nullptr;
     if (fp_guard && live_fp != 0 && c.residency_fp != live_fp) return fail(error, "expert residency changed since capture");
+    // #606 layer-aware: the compute path IS part of f. A checkpoint made under another compute path is not
+    // this engine's function of the prefix: refuse - the caller's cache-miss path re-reads the tokens.
+    // 0 on either side means "never compared": an unstamped checkpoint predates the stamp; an engine that
+    // never set one (no main() wiring) stays exactly today's behavior.
+    if (g_compute_fp != 0 && c.compute_fp != 0 && c.compute_fp != g_compute_fp)
+        return fail(error, "compute path changed since capture");
     return true;
 }
 
@@ -175,6 +187,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     c.residency_fp = fp;   // #606: the table this state was a function of (0 = no tier to track)
+    c.compute_fp = g_compute_fp;   // #606: and the compute path that produced these numbers
     return true;
 }
 
